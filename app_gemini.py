@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import requests
 import streamlit as st
 
@@ -7,6 +8,8 @@ PROFILE_FILE = "profile.txt"
 MEMORY_FILE = "memory.json"
 ENV_FILE = ".env"
 MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+RETRY_TIMES = 4
 def load_key():
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key and os.path.exists(ENV_FILE):
@@ -33,8 +36,8 @@ def save_memory(memory):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
-def ask_gemini(key, system_message, memory):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent"
+def _call_gemini(key, model, system_message, memory):
+    url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
     contents = []
     for m in memory[-40:]:
         role = "user" if m["role"] == "user" else "model"
@@ -44,8 +47,34 @@ def ask_gemini(key, system_message, memory):
         "contents": contents,
     }
     r = requests.post(url, headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body, timeout=120)
-    if r.status_code != 200:
-        return "कुछ गड़बड़ हुई: " + r.text[:300]
+    return r
+
+def ask_gemini(key, system_message, memory):
+    r = None
+    for attempt in range(RETRY_TIMES + 1):
+        try:
+            r = _call_gemini(key, MODEL, system_message, memory)
+            if r.status_code == 200:
+                break
+            if r.status_code != 503:
+                break
+        except requests.Timeout:
+            r = None
+        if attempt < RETRY_TIMES:
+            time.sleep(2 * (attempt + 1))
+    if r is None or r.status_code != 200:
+        last_error = "टाइमआउट हो गया" if r is None else ("कुछ गड़बड़ हुई: " + r.text[:300])
+        try:
+            r2 = _call_gemini(key, FALLBACK_MODEL, system_message, memory)
+            if r2.status_code == 200:
+                data = r2.json()
+                try:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception:
+                    return "जवाब नहीं मिला: " + json.dumps(data)[:300]
+        except requests.Timeout:
+            pass
+        return last_error
     data = r.json()
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
